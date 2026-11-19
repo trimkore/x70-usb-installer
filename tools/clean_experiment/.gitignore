@@ -1,0 +1,12 @@
+__pycache__/
+*.zip
+*.bin
+*.so
+*.apk
+*.odex
+evidence.json
+supplement.json
+results.json
+keys
+output/
+analysis/
