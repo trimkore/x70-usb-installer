@@ -41,12 +41,12 @@ no updater instruction executes. There is no post-dispatch result.
 Guest syscalls/interrupts stop execution: there is no syscall passthrough,
 network connection, real sysfs access, device access, reboot, or partition write.
 Only allowlisted paths in disposable storage are exposed. Package/key writes are
-blocked. Guest data pages are non-executable; only the verifier's executable
+blocked. Guest data pages are non-executable; only the pinned verifier and explicitly loaded native ICU/ABI executable
 segments can run. Unknown imports and memory accesses stop as **unsupported**,
 not as a package rejection. This is an application-level emulation boundary,
 not a whole Android VM or a host OS network-policy change.
 
-Without `--xml-shim`, the current original-package run stops on unresolved
+Without either `--native-icu` or `--xml-shim`, the original-package run stops on unresolved
 `ucnv_open_51` during native XML encoding setup. With it, host ElementTree supplies
 the XML tree and native project/type checks continue. The option does not prove
 that libxml2/ICU would accept the document on Android. Java, Binder, the daemon
@@ -84,3 +84,28 @@ stage logging and preservation of status bytes after NUL. They validate the
 harness boundary, not all libc/Android semantics. See RESULTS.md for findings.
 
 To reproduce the full matrix: `python tools/arm_verifier/run_matrix.py --workspace E:\x70`. Raw results stay under the private workspace analysis directory.
+
+## Native ICU mode
+
+Use `--native-icu` for native XML with the extracted package's ICU 51 data/code.
+It cannot be combined with `--xml-shim`. The SHA256-pinned libicuuc and libgabi++
+modules are relocated into guest memory; package libc is mapped non-executable
+only to supply its preinitialized uppercase table. No libc initializers run.
+Unresolved dependencies have unmapped guard addresses and fail on use. ICU data
+is registered through an actual native call to udata_setCommonData_51; this is
+explicit provisioning, not Android dynamic-linker/startup emulation. Native XML
+functions and ICU converters execute; no XML tree or successful result is mocked.
+Existing libc, hashing, I/O and runtime shims remain disclosed in the results.
+
+```powershell
+python tools/arm_verifier/harness.py --workspace E:\x70 --package original --native-icu --out E:\x70\analysis\emulation\icu\original-native-icu.json
+python tools/arm_verifier/harness.py --workspace E:\x70 --package clean --native-icu --out E:\x70\analysis\emulation\icu\clean-native-icu.json
+python tools/arm_verifier/harness.py --workspace E:\x70 --package original --native-icu --scenario product-mismatch --out E:\x70\analysis\emulation\icu\original-native-icu-product-mismatch.json
+python tools/arm_verifier/probe_xml.py --workspace E:\x70
+```
+
+The fixture probe invokes native xmlReadFile and root access on disposable XML
+fixtures, never creates an update package, and asserts that empty input has no
+root. Options value 1 admits an unclosed fixture with a root; document-pointer
+success is not a strict well-formedness test. A separate full native product
+mismatch run demonstrates manifest rejection before dispatch.

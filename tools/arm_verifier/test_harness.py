@@ -95,6 +95,49 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(h.events[-1]['bytes'], '30000500')
         self.assertEqual(h.events[-1]['return_code'], 4)
 
+    def test_icu_paths_stay_read_only_and_bounded(self):
+        h = self.make()
+        h.extra_read_roots = ('/system/usr/icu/', '/usr/icu/')
+        self.assertEqual(h.path(b'/usr/icu/data'), self.root / 'usr/icu/data')
+        for name, write in ((b'/usr/icu/data', True), (b'/usr/icu/../../package.zip', False)):
+            with self.assertRaises(harness.Unsupported):
+                h.path(name, write)
+
+    def test_signed_division_remainder(self):
+        h = self.make()
+        h.uc.reg_write(harness.UC_ARM_REG_R0, (-7) & 0xffffffff)
+        h.uc.reg_write(harness.UC_ARM_REG_R1, 3)
+        h.uc.reg_write(harness.UC_ARM_REG_LR, 0x70000001)
+        h.shim('idivmod')
+        self.assertEqual(h.signed(h.arg(0)), -2)
+        self.assertEqual(h.signed(h.arg(1)), -1)
+
+    def test_multiple_maps_do_not_alias(self):
+        h = self.make()
+        stream = self.package.open('rb')
+        self.addCleanup(stream.close)
+        h.fd[20] = (stream, self.package, b'/mnt/udisk/update/update.zip')
+        h.put32(h.uc.reg_read(harness.UC_ARM_REG_SP), 20)
+        addresses = []
+        for _ in range(2):
+            for reg, value in zip(harness.REGS, (0, 4096, 1, 2)):
+                h.uc.reg_write(reg, value)
+            h.uc.reg_write(harness.UC_ARM_REG_LR, 0x70000001)
+            h.shim('mmap')
+            addresses.append(h.arg(0))
+        self.assertEqual(addresses, [0x20000000, 0x20001000])
+
+    def test_stderr_is_only_a_diagnostic_event(self):
+        h = self.make()
+        ptr = h.cstr('error')
+        for reg, value in zip(harness.REGS, (2, ptr, 5, 0)):
+            h.uc.reg_write(reg, value)
+        h.uc.reg_write(harness.UC_ARM_REG_LR, 0x70000001)
+        h.shim('write')
+        self.assertEqual(h.events[-1]['origin'], 'host_diagnostic_sink')
+        self.assertEqual(h.events[-1]['text'], 'error')
+        self.assertFalse(h.fd)
+
     def test_unknown_binary_rejected(self):
         h = self.make()
         with self.assertRaises(ValueError):

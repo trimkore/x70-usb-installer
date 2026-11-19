@@ -145,6 +145,12 @@ class Harness:
         if name=='/mnt/udisk/update/update.zip':
             if write:raise Unsupported('package write blocked')
             return self.package
+        if any(name.startswith(prefix) for prefix in getattr(self,'extra_read_roots',())):
+            if write:raise Unsupported('ICU dependency write blocked')
+            path=(self.root/name.lstrip('/')).resolve()
+            prefix=next(prefix for prefix in self.extra_read_roots if name.startswith(prefix))
+            if not path.is_relative_to((self.root/prefix.lstrip('/')).resolve()):raise Unsupported('ICU path escape')
+            return path
         allowed={'/system/etc/keys','/data/Manifest.xml','/data/updater','/sys/devices/platform/debug_control/percent_write','/sys/devices/platform/debug_control/percent_read'}
         if name not in allowed:raise Unsupported('unmapped guest path: '+name)
         if write and name=='/system/etc/keys':raise Unsupported('key write blocked')
@@ -216,16 +222,19 @@ class Harness:
     def shim(self,name):
         a,b,c,d=[self.arg(i) for i in range(4)]
         self.counts[name]+=1
+        if name.startswith('native_redirect:'):
+            self.events.append(dict(event='native_import_call',origin='package_matched_native_library',target=hex(int(name.split(':')[1])),arguments=[hex(v) for v in (a,b,c,d)]))
+            self.uc.reg_write(UC_ARM_REG_PC,int(name.split(':')[1]));return
         if name=='time':
             value=1700000000
             if a:self.put32(a,value)
             self.events.append(dict(event='time',origin='host_runtime_shim',return_code=value))
             return self.ret(value)
-        if name in ('uidiv','uidivmod','idiv'):
-            x,y=(self.signed(a),self.signed(b)) if name=='idiv' else (a,b)
+        if name in ('uidiv','uidivmod','idiv','idivmod'):
+            x,y=(self.signed(a),self.signed(b)) if name in ('idiv','idivmod') else (a,b)
             if y==0:raise Unsupported('division by zero')
             q=abs(x)//abs(y)*(1 if x*y>=0 else -1)
-            if name=='uidivmod':self.uc.reg_write(UC_ARM_REG_R1,x-q*y)
+            if name in ('uidivmod','idivmod'):self.uc.reg_write(UC_ARM_REG_R1,(x-q*y)&0xffffffff)
             return self.ret(q)
         if name in ('malloc','calloc'):
             return self.ret(self.alloc(a*b if name=='calloc' else a))
@@ -276,6 +285,10 @@ class Harness:
             return self.ret(len(raw) if name=='read' else len(raw)//max(b,1))
         if name in ('write','fwrite'):
             fd,ptr,length=(a,b,c) if name=='write' else (d,a,b*c)
+            if fd in (1,2):
+                if length>65536:raise Unsupported('diagnostic write too large')
+                raw=self.readmem(ptr,length);self.events.append(dict(event='stdio_write',origin='host_diagnostic_sink',fd=fd,bytes=raw.hex(),text=raw.decode('utf-8','replace'),return_code=length))
+                return self.ret(length if name=='write' else c)
             if fd not in self.fd:raise Unsupported('write to unmodeled fd')
             f,path,guest=self.fd[fd];raw=self.readmem(ptr,length);f.write(raw);f.flush()
             if b'percent_write' in guest:
@@ -289,7 +302,9 @@ class Harness:
         if name=='mmap':
             fd,offset=self.arg(4),self.arg(5)
             if c & 6:raise Unsupported('writable/executable file map blocked')
-            base=0x20000000;self.file_maps.append((base,b,self.fd[fd][1],offset));return self.ret(base)
+            base=max([0x20000000]+[((start+size+4095)&~4095) for start,size,_,_ in self.file_maps])
+            if base+b>=0x58000000:raise Unsupported('file map budget exceeded')
+            self.file_maps.append((base,b,self.fd[fd][1],offset));return self.ret(base)
         if name in ('unlink','remove'):
             path=self.path(self.string(a),True)
             if path.exists():path.unlink()
@@ -399,8 +414,10 @@ class Harness:
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--workspace',type=Path,required=True);p.add_argument('--package',choices=['original','clean'],required=True);p.add_argument('--scenario',default='baseline',choices=['baseline','package-denied','key-denied','manifest-denied','status-denied','stale-status','product-mismatch','xml-fail']);p.add_argument('--xml-shim',action='store_true');p.add_argument('--out',type=Path,required=True);p.add_argument('--entry',default='install',choices=['install','zip'])
-    args=p.parse_args();w=args.workspace.resolve();e=json.loads((w/'analysis/evidence.json').read_text())
+    p=argparse.ArgumentParser();p.add_argument('--workspace',type=Path,required=True);p.add_argument('--package',choices=['original','clean'],required=True);p.add_argument('--scenario',default='baseline',choices=['baseline','package-denied','key-denied','manifest-denied','status-denied','stale-status','product-mismatch','xml-fail']);p.add_argument('--xml-shim',action='store_true');p.add_argument('--native-icu',action='store_true');p.add_argument('--out',type=Path,required=True);p.add_argument('--entry',default='install',choices=['install','zip'])
+    args=p.parse_args()
+    if args.xml_shim and args.native_icu:p.error('--native-icu cannot be combined with --xml-shim')
+    w=args.workspace.resolve();e=json.loads((w/'analysis/evidence.json').read_text())
     args.out=args.out.resolve()
     if args.out.suffix!='.json' or not args.out.is_relative_to((w/'analysis').resolve()):
         raise ValueError('diagnostics must be a .json file under workspace/analysis')
@@ -421,8 +438,18 @@ def main():
         shutil.copyfile(file('system/etc/keys'),root/'system/etc/keys')
         (root/'sys/devices/platform/debug_control/percent_write').write_bytes(b'0\0\0\0')
         h=Harness(file('system/bin/vold'),w/'analysis/trace/vold-symbols.txt',root,package,args.scenario,args.xml_shim)
+        if args.native_icu:
+            from native_icu import attach
+            exports,data,unresolved=attach(h,entries,file('system/bin/vold'))
+            status=h.alloc(4);h.put32(status,0)
+            initialization=h.run(exports['udata_setCommonData_51'],[data,status])
+            h.events.append(dict(event='icu_data_registration',origin='native_ICU_public_API',address=hex(exports['udata_setCommonData_51']),error_code=h.u32(status),outcome=initialization['outcome']))
+            if initialization['outcome']['kind']!='returned' or h.u32(status)!=0:
+                args.out.parent.mkdir(parents=True,exist_ok=True);args.out.write_text(json.dumps(initialization,indent=2),encoding='utf-8')
+                raise RuntimeError('Native ICU data initialization did not complete; stopped')
+            h.stopped=None;h.returns={};h.uc.reg_write(UC_ARM_REG_SP,0x710ff000)
         result=h.run() if args.entry=='install' else h.run(0x17e70,[h.cstr('/mnt/udisk/update/update.zip'),h.alloc(32)])
-        result.update(package=args.package,scenario=args.scenario,entry=args.entry,verifier_sha256=hashlib.sha256(file('system/bin/vold').read_bytes()).hexdigest())
+        result.update(native_icu=args.native_icu,package=args.package,scenario=args.scenario,entry=args.entry,verifier_sha256=hashlib.sha256(file('system/bin/vold').read_bytes()).hexdigest())
         result.update(package_sha256=source_hash,source_unchanged=digest(source)==source_hash,disposable_copy_unchanged=digest(package)==source_hash,assumption='Installed verifier/key provisionally assumed equal; not established',status_scope='Mock sysfs only; no real-car status captured',host_shims='libc, file I/O, arithmetic imports, hash compression, time, properties, pipe/fork; XML only if requested')
         args.out.parent.mkdir(parents=True,exist_ok=True);args.out.write_text(json.dumps(result,indent=2),encoding='utf-8')
         print(json.dumps({k:result[k] for k in ('package','scenario','entry','outcome','seconds','shim_calls','recent_blocks')},indent=2))
